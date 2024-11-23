@@ -20,20 +20,21 @@
       versionInfo = import ./version.nix;
       version = versionInfo.version + (lib.optionalString (!versionInfo.released) "-dirty");
 
-      diskoLib = import ./lib {
+      diskoLib = import ./src/disko_lib {
         inherit (nixpkgs) lib;
       };
     in
     {
+      lib = diskoLib;
       nixosModules.default = self.nixosModules.disko; # convention
       nixosModules.disko.imports = [ ./module.nix ];
-      lib = diskoLib;
       packages = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
           disko = pkgs.callPackage ./package.nix { diskoVersion = version; };
+          disko2 = pkgs.callPackage ./package-disko2.nix { diskoVersion = version; };
           # alias to make `nix run` more convenient
           disko-install = self.packages.${system}.disko.overrideAttrs (_old: {
             name = "disko-install";
@@ -41,7 +42,7 @@
           default = self.packages.${system}.disko;
 
           create-release = pkgs.callPackage ./scripts/create-release.nix { };
-        } // pkgs.lib.optionalAttrs (!pkgs.stdenv.buildPlatform.isRiscV64) {
+        } // pkgs.lib.optionalAttrs (!pkgs.buildPlatform.isRiscV64) {
           disko-doc = pkgs.callPackage ./doc.nix { };
         });
       # TODO: disable bios-related tests on aarch64...
@@ -50,7 +51,7 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           # FIXME: aarch64-linux seems to hang on boot
-          nixosTests = lib.optionalAttrs pkgs.stdenv.hostPlatform.isx86_64 (import ./tests {
+          nixosTests = lib.optionalAttrs pkgs.hostPlatform.isx86_64 (import ./tests {
             inherit pkgs;
             makeTest = import (pkgs.path + "/nixos/tests/make-test-python.nix");
             eval-config = import (pkgs.path + "/nixos/lib/eval-config.nix");
@@ -61,19 +62,49 @@
             diskoVersion = version;
           };
 
+          # TODO: Add a CI pipeline instead that runs nix run .#pytest inside nix develop
+          pytest-ci-only = pkgs.runCommand "pytest" { nativeBuildInputs = [ pkgs.python3Packages.pytest ]; } ''
+            cd ${./.}
+            # eval_config runs nix, which is forbidden inside of nix derivations by default
+            pytest -vv --doctest-modules -p no:cacheprovider --ignore=tests/disko_lib/eval_config
+            touch $out
+          '';
+
           shellcheck = pkgs.runCommand "shellcheck" { nativeBuildInputs = [ pkgs.shellcheck ]; } ''
             cd ${./.}
-            shellcheck disk-deactivate/disk-deactivate disko
+            shellcheck src/disk-deactivate/disk-deactivate disko disko2
             touch $out
           '';
 
           jsonTypes = pkgs.writeTextFile { name = "jsonTypes"; text = (builtins.toJSON diskoLib.jsonTypes); };
         in
         # FIXME: aarch64-linux seems to hang on boot
-        lib.optionalAttrs pkgs.stdenv.hostPlatform.isx86_64 (nixosTests // { inherit disko-install; }) //
-        pkgs.lib.optionalAttrs (!pkgs.stdenv.buildPlatform.isRiscV64 && !pkgs.stdenv.hostPlatform.isx86_32) {
-          inherit shellcheck jsonTypes;
+        lib.optionalAttrs pkgs.hostPlatform.isx86_64 (nixosTests // { inherit disko-install; }) //
+        pkgs.lib.optionalAttrs (!pkgs.buildPlatform.isRiscV64 && !pkgs.hostPlatform.isx86_32) {
+          inherit pytest-ci-only shellcheck jsonTypes;
           inherit (self.packages.${system}) disko-doc;
+        });
+
+      devShells = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          default = pkgs.mkShell {
+            name = "disko-dev";
+            packages = (with pkgs; [
+              nixpkgs-fmt # Formatter for Nix code
+              shellcheck # Linter for shell scripts
+              ruff # Formatter and linter for Python
+              (python3.withPackages (ps: [
+                ps.mypy # Static type checker
+                ps.pytest # Test runner
+
+                # Actual runtime depedencies
+                ps.pydantic # Validation of nixos configuration
+              ]))
+            ]);
+          };
         });
 
       nixosConfigurations.testmachine = lib.nixosSystem {
@@ -94,6 +125,7 @@
             nixpkgs-fmt
             deno
             deadnix
+            ruff
           ];
           text = ''
             showUsage() {
@@ -138,12 +170,16 @@
                 nixpkgs-fmt -- "''${files[@]}"
                 deno fmt -- "''${files[@]}"
                 deadnix --edit -- "''${files[@]}"
+                ruff check --fix
+                ruff format
               else
                 set -o xtrace
 
                 nixpkgs-fmt --check -- "''${files[@]}"
                 deno fmt --check -- "''${files[@]}"
                 deadnix -- "''${files[@]}"
+                ruff check
+                ruff format --check
               fi
             }
 

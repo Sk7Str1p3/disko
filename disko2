@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# This script only exists so you can run `./disko2` directly
+# It should not be be installed as part of the package!
+# Check src/disko/cli.py for the actual entrypoint
+
+set -euo pipefail
+PYTHONPATH="$(dirname "$(realpath "$0")")"/src python3 -m disko "$@"
